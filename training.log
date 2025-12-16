@@ -1,0 +1,10 @@
+warning: No `requires-python` value found in the workspace. Defaulting to `>=3.12`.
+usage: train_ocid.py [-h] [--config_file CONFIG_FILE] [--ckpt_path CKPT_PATH]
+                     [--device DEVICE] [--data_dir DATA_DIR]
+                     [--batch_size BATCH_SIZE] [--num_frames NUM_FRAMES]
+                     [--image_size IMAGE_SIZE] [--num_workers NUM_WORKERS]
+                     [--train_ratio TRAIN_RATIO] [--output_dir OUTPUT_DIR]
+                     [--num_epochs NUM_EPOCHS] [--learning_rate LEARNING_RATE]
+                     [--weight_decay WEIGHT_DECAY]
+                     [--max_grad_norm MAX_GRAD_NORM] [--save_steps SAVE_STEPS]
+train_ocid.py: error: unrecognized arguments:           

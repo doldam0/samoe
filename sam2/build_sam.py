@@ -161,13 +161,151 @@ def build_sam2_video_predictor_hf(model_id, **kwargs):
     )
 
 
+def build_sam2_moe(
+    config_file="configs/sam2.1/sam2.1_hiera_b+_moe.yaml",
+    ckpt_path=None,
+    device="cuda",
+    mode="eval",
+    hydra_overrides_extra=[],
+    apply_postprocessing=True,
+    **kwargs,
+):
+    """
+    Build SAM2 model with Mixture of Prompt Experts (MoPE).
+
+    This function builds a SAM2 model with MoE-LoRA adapters in the
+    Memory Attention projection layers. It can optionally load base
+    weights from a pre-trained checkpoint (the LoRA adapters will be
+    randomly initialized).
+
+    Args:
+        config_file: Path to MoE configuration file
+        ckpt_path: Path to pre-trained SAM2 checkpoint (optional)
+        device: Device to load model on
+        mode: 'eval' or 'train'
+        hydra_overrides_extra: Additional Hydra config overrides
+        apply_postprocessing: Apply post-processing settings
+        **kwargs: Additional arguments
+
+    Returns:
+        SAM2 model with MoE-LoRA adapters
+    """
+    model = build_sam2(
+        config_file=config_file,
+        ckpt_path=ckpt_path,
+        device=device,
+        mode=mode,
+        hydra_overrides_extra=hydra_overrides_extra,
+        apply_postprocessing=apply_postprocessing,
+        **kwargs,
+    )
+
+    # Freeze all parameters first
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Unfreeze only MoE adapters (LoRA and gating networks)
+    for name, param in model.named_parameters():
+        if any(keyword in name for keyword in ['lora', 'gate', 'experts']):
+            param.requires_grad = True
+
+    return model
+
+
+def build_sam2_video_predictor_moe(
+    config_file="configs/sam2.1/sam2.1_hiera_b+_moe.yaml",
+    ckpt_path=None,
+    device="cuda",
+    mode="eval",
+    hydra_overrides_extra=[],
+    apply_postprocessing=True,
+    vos_optimized=False,
+    **kwargs,
+):
+    """
+    Build SAM2 video predictor with Mixture of Prompt Experts (MoPE).
+
+    This function builds a SAM2 video predictor with MoE-LoRA adapters
+    in the Memory Attention projection layers.
+
+    Args:
+        config_file: Path to MoE configuration file
+        ckpt_path: Path to pre-trained SAM2 checkpoint (optional)
+        device: Device to load model on
+        mode: 'eval' or 'train'
+        hydra_overrides_extra: Additional Hydra config overrides
+        apply_postprocessing: Apply post-processing settings
+        vos_optimized: Use VOS-optimized predictor
+        **kwargs: Additional arguments
+
+    Returns:
+        SAM2VideoPredictor with MoE-LoRA adapters
+    """
+    model = build_sam2_video_predictor(
+        config_file=config_file,
+        ckpt_path=ckpt_path,
+        device=device,
+        mode=mode,
+        hydra_overrides_extra=hydra_overrides_extra,
+        apply_postprocessing=apply_postprocessing,
+        vos_optimized=vos_optimized,
+        **kwargs,
+    )
+
+    # Freeze all parameters first
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Unfreeze only MoE adapters (LoRA and gating networks)
+    for name, param in model.named_parameters():
+        if any(keyword in name for keyword in ['lora', 'gate', 'experts']):
+            param.requires_grad = True
+
+    return model
+
+
 def _load_checkpoint(model, ckpt_path):
     if ckpt_path is not None:
         sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)["model"]
-        missing_keys, unexpected_keys = model.load_state_dict(sd)
+
+        # Map checkpoint keys to MoE model keys (if MoE model is used)
+        # For MoE models, projection layers are wrapped: proj -> proj.base_layer
+        model_keys = set(model.state_dict().keys())
+
+        # Check if this is a MoE model
+        is_moe_model = any('base_layer' in k for k in model_keys)
+
+        if is_moe_model:
+            # Remap checkpoint keys for MoE models
+            sd_remapped = {}
+            for key, value in sd.items():
+                # If key is a projection layer in memory attention, remap to base_layer
+                if any(pattern in key for pattern in [
+                    '.q_proj.weight', '.q_proj.bias',
+                    '.k_proj.weight', '.k_proj.bias',
+                    '.v_proj.weight', '.v_proj.bias',
+                    '.out_proj.weight', '.out_proj.bias'
+                ]) and 'memory_attention' in key:
+                    # Remap: memory_attention.layers.X.Y.proj -> memory_attention.layers.X.Y.proj.base_layer
+                    new_key = key.replace('.weight', '.base_layer.weight').replace('.bias', '.base_layer.bias')
+                    sd_remapped[new_key] = value
+                else:
+                    sd_remapped[key] = value
+            sd = sd_remapped
+
+        missing_keys, unexpected_keys = model.load_state_dict(sd, strict=False)
         if missing_keys:
-            logging.error(missing_keys)
-            raise RuntimeError()
+            # Filter out expected missing keys for MoE models (LoRA adapters)
+            moe_keys = [k for k in missing_keys if 'lora' in k or 'gate' in k or 'experts' in k]
+            non_moe_keys = [k for k in missing_keys if k not in moe_keys]
+
+            if moe_keys:
+                logging.info(f"MoE adapter keys not loaded (expected): {len(moe_keys)} keys")
+            if non_moe_keys:
+                logging.warning(f"Missing non-MoE keys: {non_moe_keys}")
+                # Only raise error for non-MoE missing keys if they exist
+                if non_moe_keys:
+                    raise RuntimeError(f"Missing keys: {non_moe_keys}")
         if unexpected_keys:
             logging.error(unexpected_keys)
             raise RuntimeError()

@@ -1,0 +1,123 @@
+# SAM2-MoE Training Configuration
+
+# Model Configuration
+model:
+  config_file: "configs/sam2.1/sam2.1_hiera_b+_moe.yaml"
+  ckpt_path: "checkpoints/sam2.1_hiera_base_plus.pt"
+  device: "cuda"  # or "cpu"
+
+# Training Configuration
+training:
+  # Output
+  output_dir: "outputs/moe_training"
+  experiment_name: "sam2_moe_base_plus"
+
+  # Optimization
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+  # Scheduler
+  scheduler: "cosine"  # cosine, linear, constant
+  warmup_steps: 500
+  min_lr_ratio: 0.01  # min_lr = lr * min_lr_ratio
+
+  # Training Loop
+  num_epochs: 10
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  effective_batch_size: 8  # batch_size * gradient_accumulation_steps
+
+  # Logging & Checkpointing
+  logging_steps: 100
+  save_steps: 1000
+  eval_steps: 500
+
+  # Mixed Precision (optional)
+  use_amp: true  # Automatic Mixed Precision
+  amp_dtype: "float16"  # float16 or bfloat16
+
+# Data Configuration
+data:
+  # Dataset paths
+  train_data_dir: "data/train"
+  val_data_dir: "data/val"
+
+  # Video settings
+  num_frames: 8  # Number of frames per video clip
+  frame_size: 1024  # Input image size
+  frame_stride: 1  # Skip frames
+
+  # Data augmentation
+  augmentation:
+    horizontal_flip: 0.5
+    color_jitter: 0.2
+    random_crop: true
+
+  # DataLoader
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+
+# Loss Configuration
+loss:
+  # Mask loss
+  mask_loss_weight: 1.0
+  dice_loss_weight: 1.0
+  focal_loss_weight: 1.0
+
+  # IoU loss
+  iou_loss_weight: 0.1
+
+  # Focal loss parameters
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+# MoE-Specific Configuration
+moe:
+  # Expert usage monitoring
+  log_expert_usage: true
+  expert_usage_interval: 500  # Log every N steps
+
+  # Load balancing (optional)
+  load_balance_loss: false
+  load_balance_weight: 0.01
+
+  # Expert specialization tracking
+  track_specialization: true
+  specialization_interval: 1000
+
+# Validation Configuration
+validation:
+  eval_batch_size: 1
+  num_eval_samples: 100
+  save_predictions: true
+  prediction_dir: "outputs/predictions"
+
+# Checkpoint Configuration
+checkpoint:
+  save_optimizer: true
+  save_scheduler: true
+  keep_last_n: 5  # Keep only last N checkpoints
+  save_best: true
+  metric: "val_iou"  # Metric for best checkpoint
+
+# Logging
+logging:
+  log_level: "INFO"
+  log_file: "outputs/training.log"
+  tensorboard_dir: "outputs/tensorboard"
+  wandb:
+    enabled: false
+    project: "sam2-moe"
+    entity: null
+    run_name: null
+
+# Reproducibility
+seed: 42
+deterministic: false
+
+# Resource Management
+resources:
+  max_gpu_memory: null  # GB, null for unlimited
+  empty_cache_interval: 100  # Empty CUDA cache every N steps
