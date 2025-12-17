@@ -6,13 +6,14 @@ Each sequence contains RGB images and segmentation labels.
 """
 
 import os
-from pathlib import Path
-from typing import List, Tuple, Dict
-import numpy as np
-from PIL import Image
-import torch
-from torch.utils.data import Dataset
 import random
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import Dataset
 
 
 class OCIDSequenceDataset(Dataset):
@@ -32,39 +33,61 @@ class OCIDSequenceDataset(Dataset):
 
     def __init__(
         self,
-        root_dir: str = "data/OCID-dataset",
+        root_dir: str = "data/OCID-dataset/ARID20",
         split: str = "train",
         num_frames: int = 8,
         image_size: int = 1024,
         train_ratio: float = 0.8,
         random_seed: int = 42,
+        test_sequences: List[str] = None,
     ):
         """
         Args:
             root_dir: Path to OCID-dataset directory
-            split: 'train' or 'val'
+            split: 'train', 'val', or 'test'
             num_frames: Number of frames to sample from each sequence
             image_size: Image size (will be resized to square)
-            train_ratio: Ratio of sequences for training
-            random_seed: Random seed for split
+            train_ratio: Ratio of train sequences (from non-test sequences)
+            random_seed: Random seed for train/val split
+            test_sequences: List of sequence names for test (e.g., ["seq13"])
+                           If None, defaults to ["seq13"]
         """
         self.root_dir = Path(root_dir)
         self.split = split
         self.num_frames = num_frames
         self.image_size = image_size
 
+        # Default test sequences
+        if test_sequences is None:
+            test_sequences = ["seq13"]
+        self.test_sequences = test_sequences
+
         # Find all sequences
-        self.sequences = self._find_sequences()
+        all_sequences = self._find_sequences()
 
-        # Train/val split
-        random.seed(random_seed)
-        random.shuffle(self.sequences)
-        split_idx = int(len(self.sequences) * train_ratio)
+        # Split into test and train/val
+        test_seqs = []
+        trainval_seqs = []
 
-        if split == "train":
-            self.sequences = self.sequences[:split_idx]
+        for seq in all_sequences:
+            seq_name = seq.name  # e.g., "seq13"
+            if seq_name in self.test_sequences:
+                test_seqs.append(seq)
+            else:
+                trainval_seqs.append(seq)
+
+        if split == "test":
+            self.sequences = test_seqs
         else:
-            self.sequences = self.sequences[split_idx:]
+            # Train/val split from non-test sequences
+            random.seed(random_seed)
+            random.shuffle(trainval_seqs)
+            split_idx = int(len(trainval_seqs) * train_ratio)
+
+            if split == "train":
+                self.sequences = trainval_seqs[:split_idx]
+            else:  # val
+                self.sequences = trainval_seqs[split_idx:]
 
         print(f"Loaded {len(self.sequences)} sequences for {split}")
 
@@ -73,24 +96,20 @@ class OCIDSequenceDataset(Dataset):
         sequences = []
 
         # Search pattern: OCID-dataset/*/surface/view/category/seqXX/
-        for dataset_type in ["ARID10", "ARID20", "YCB10"]:
-            dataset_path = self.root_dir / dataset_type
+        dataset_path = self.root_dir
 
-            if not dataset_path.exists():
-                continue
+        # Recursively find directories containing 'rgb' and 'label' subdirs
+        for seq_dir in dataset_path.rglob("seq*"):
+            rgb_dir = seq_dir / "rgb"
+            label_dir = seq_dir / "label"
 
-            # Recursively find directories containing 'rgb' and 'label' subdirs
-            for seq_dir in dataset_path.rglob("seq*"):
-                rgb_dir = seq_dir / "rgb"
-                label_dir = seq_dir / "label"
+            if rgb_dir.exists() and label_dir.exists():
+                # Check if there are matching files
+                rgb_files = sorted(list(rgb_dir.glob("*.png")))
+                label_files = sorted(list(label_dir.glob("*.png")))
 
-                if rgb_dir.exists() and label_dir.exists():
-                    # Check if there are matching files
-                    rgb_files = sorted(list(rgb_dir.glob("*.png")))
-                    label_files = sorted(list(label_dir.glob("*.png")))
-
-                    if len(rgb_files) > 0 and len(label_files) > 0:
-                        sequences.append(seq_dir)
+                if len(rgb_files) > 0 and len(label_files) > 0:
+                    sequences.append(seq_dir)
 
         return sequences
 
@@ -115,9 +134,7 @@ class OCIDSequenceDataset(Dataset):
         return pairs
 
     def _sample_frames(
-        self,
-        pairs: List[Tuple[Path, Path]],
-        num_frames: int
+        self, pairs: List[Tuple[Path, Path]], num_frames: int
     ) -> List[Tuple[Path, Path]]:
         """Sample frames from sequence."""
         if len(pairs) <= num_frames:
@@ -146,7 +163,9 @@ class OCIDSequenceDataset(Dataset):
         mask = torch.from_numpy(mask)
         return mask
 
-    def _get_prompt_points(self, mask: torch.Tensor, num_points: int = 5) -> torch.Tensor:
+    def _get_prompt_points(
+        self, mask: torch.Tensor, num_points: int = 5
+    ) -> torch.Tensor:
         """
         Sample positive points from mask for prompting SAM2.
 
@@ -206,7 +225,7 @@ class OCIDSequenceDataset(Dataset):
             masks.append(mask)
 
         frames = torch.stack(frames)  # (T, C, H, W)
-        masks = torch.stack(masks)    # (T, H, W)
+        masks = torch.stack(masks)  # (T, H, W)
 
         # Get prompt points from first frame
         points = self._get_prompt_points(masks[0], num_points=5)
@@ -226,8 +245,10 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     Since sequences may have different lengths, we return lists.
     """
     return {
-        "frames": torch.stack([item["frames"] for item in batch]),  # (B, T, C, H, W)
-        "masks": torch.stack([item["masks"] for item in batch]),    # (B, T, H, W)
+        "frames": torch.stack(
+            [item["frames"] for item in batch]
+        ),  # (B, T, C, H, W)
+        "masks": torch.stack([item["masks"] for item in batch]),  # (B, T, H, W)
         "points": [item["points"] for item in batch],  # List of (N, 2)
         "seq_names": [item["seq_name"] for item in batch],
     }
@@ -240,9 +261,11 @@ def get_dataloaders(
     image_size: int = 1024,
     num_workers: int = 4,
     train_ratio: float = 0.8,
+    test_sequences: List[str] = None,
+    include_test: bool = False,
 ):
     """
-    Create train and validation dataloaders.
+    Create train, validation, and optionally test dataloaders.
 
     Args:
         root_dir: Path to OCID dataset
@@ -250,10 +273,12 @@ def get_dataloaders(
         num_frames: Number of frames per sequence
         image_size: Image size
         num_workers: Number of dataloader workers
-        train_ratio: Train/val split ratio
+        train_ratio: Train/val split ratio (from non-test sequences)
+        test_sequences: List of sequence names for test (default: ["seq13"])
+        include_test: If True, returns (train_loader, val_loader, test_loader)
 
     Returns:
-        (train_loader, val_loader)
+        (train_loader, val_loader) or (train_loader, val_loader, test_loader)
     """
     train_dataset = OCIDSequenceDataset(
         root_dir=root_dir,
@@ -261,6 +286,7 @@ def get_dataloaders(
         num_frames=num_frames,
         image_size=image_size,
         train_ratio=train_ratio,
+        test_sequences=test_sequences,
     )
 
     val_dataset = OCIDSequenceDataset(
@@ -269,6 +295,7 @@ def get_dataloaders(
         num_frames=num_frames,
         image_size=image_size,
         train_ratio=train_ratio,
+        test_sequences=test_sequences,
     )
 
     train_loader = torch.utils.data.DataLoader(
@@ -288,6 +315,26 @@ def get_dataloaders(
         collate_fn=collate_fn,
         pin_memory=True,
     )
+
+    if include_test:
+        test_dataset = OCIDSequenceDataset(
+            root_dir=root_dir,
+            split="test",
+            num_frames=num_frames,
+            image_size=image_size,
+            test_sequences=test_sequences,
+        )
+
+        test_loader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
+
+        return train_loader, val_loader, test_loader
 
     return train_loader, val_loader
 
@@ -329,8 +376,9 @@ if __name__ == "__main__":
     batch = next(iter(train_loader))
     print(f"\nBatch:")
     print(f"  Frames: {batch['frames'].shape}")  # (B, T, C, H, W)
-    print(f"  Masks: {batch['masks'].shape}")    # (B, T, H, W)
+    print(f"  Masks: {batch['masks'].shape}")  # (B, T, H, W)
     print(f"  Points: {len(batch['points'])} sequences")
     print(f"  Seq names: {batch['seq_names']}")
 
+    print("\n✓ Dataset loader working correctly!")
     print("\n✓ Dataset loader working correctly!")
