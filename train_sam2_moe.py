@@ -27,8 +27,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
+import math
 from tqdm import tqdm
 
 from ocid_dataset import get_dataloaders
@@ -77,6 +78,38 @@ class FocalLoss(nn.Module):
         pt = torch.exp(-bce)
         focal = self.alpha * (1 - pt) ** self.gamma * bce
         return focal.mean()
+
+
+def get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    num_cycles: float = 0.5,
+    min_lr_ratio: float = 0.01,
+):
+    """
+    Create a schedule with linear warmup and cosine decay.
+
+    Args:
+        optimizer: The optimizer.
+        num_warmup_steps: Number of warmup steps.
+        num_training_steps: Total number of training steps.
+        num_cycles: Number of cosine cycles (0.5 = half cycle, decays to min).
+        min_lr_ratio: Minimum learning rate as ratio of initial lr.
+    """
+    def lr_lambda(current_step: int) -> float:
+        # Warmup phase
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        # Cosine decay phase
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
+        )
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * num_cycles * 2.0 * progress))
+        # Scale between min_lr_ratio and 1.0
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+
+    return LambdaLR(optimizer, lr_lambda)
 
 
 class SAM2MoETrainer:
@@ -128,13 +161,6 @@ class SAM2MoETrainer:
             betas=(0.9, 0.999),
         )
 
-        # Setup scheduler
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=config.epochs,
-            eta_min=config.lr * 0.01,
-        )
-
         # Setup loss functions
         self.dice_loss = DiceLoss()
         self.focal_loss = FocalLoss()
@@ -150,6 +176,17 @@ class SAM2MoETrainer:
             train_ratio=config.train_ratio,
         )
         logger.info(f"Train: {len(self.train_loader)} batches, Val: {len(self.val_loader)} batches")
+
+        # Setup scheduler with warmup (needs train_loader for step count)
+        num_training_steps = config.epochs * len(self.train_loader)
+        num_warmup_steps = int(config.warmup_ratio * num_training_steps)
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            min_lr_ratio=config.min_lr_ratio,
+        )
+        logger.info(f"Scheduler: Cosine with warmup ({num_warmup_steps} warmup steps / {num_training_steps} total steps)")
 
         # Training state
         self.global_step = 0
@@ -337,7 +374,7 @@ class SAM2MoETrainer:
             points_list = batch["points"]             # List of (N, 2)
 
             B, T, C, H, W = frames.shape
-            batch_loss = 0.0
+            losses = []
             batch_metrics = {"dice": 0.0, "focal": 0.0, "total": 0.0}
             valid_frames = 0
 
@@ -368,7 +405,12 @@ class SAM2MoETrainer:
                         # Compute loss
                         loss, metrics = self.compute_loss(pred_mask, target)
 
-                        batch_loss += loss
+                        # Skip first frame (conditioning frame) for loss - it doesn't go through MoE
+                        # Memory attention (with MoE) is only used for non-conditioning frames
+                        if is_cond:
+                            continue
+
+                        losses.append(loss)
                         for k in batch_metrics:
                             batch_metrics[k] += metrics[k]
                         valid_frames += 1
@@ -377,11 +419,11 @@ class SAM2MoETrainer:
                         logger.warning(f"Error in batch {b}, frame {t}: {e}")
                         continue
 
-            if valid_frames == 0:
+            if valid_frames == 0 or len(losses) == 0:
                 continue
 
-            # Average loss over frames
-            batch_loss = batch_loss / valid_frames
+            # Stack and average losses to maintain gradient chain
+            batch_loss = torch.stack(losses).mean()
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -394,6 +436,7 @@ class SAM2MoETrainer:
             )
 
             self.optimizer.step()
+            self.scheduler.step()
 
             # Update metrics
             for k in epoch_losses:
@@ -565,9 +608,6 @@ class SAM2MoETrainer:
             # Validate
             val_metrics = self.validate(epoch)
 
-            # Update scheduler
-            self.scheduler.step()
-
             # Check if best
             is_best = val_metrics["iou"] > self.best_val_iou
             if is_best:
@@ -629,6 +669,10 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--save_every", type=int, default=10)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1,
+                        help="Ratio of total steps for warmup (default: 0.1 = 10%%)")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.01,
+                        help="Minimum LR as ratio of initial LR (default: 0.01)")
 
     # Early stopping
     parser.add_argument("--early_stopping_patience", type=int, default=15,

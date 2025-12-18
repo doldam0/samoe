@@ -2,7 +2,9 @@
 OCID Dataset Loader for SAM2-MoE Training
 
 Loads OCID (Object Clutter Indoor Dataset) for video object segmentation.
-Each sequence contains RGB images and segmentation labels.
+Each sequence contains RGB images and instance segmentation labels.
+
+Instance-aware: Each sample tracks a single object instance across frames.
 """
 
 import os
@@ -16,16 +18,21 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 
-class OCIDSequenceDataset(Dataset):
+class OCIDInstanceDataset(Dataset):
     """
-    OCID Dataset for video object segmentation.
+    OCID Dataset for instance-aware video object segmentation.
+
+    Key difference from binary segmentation:
+    - Each sample tracks ONE specific object instance
+    - Points are sampled from that specific instance
+    - Mask is binary for that instance only
 
     Dataset structure:
         OCID-dataset/
         ├── ARID10/
         │   ├── table/top/mixed/seq03/
         │   │   ├── rgb/
-        │   │   └── label/
+        │   │   └── label/  (instance IDs: 0=bg, 1,2,3...=objects)
         │   └── ...
         ├── ARID20/
         └── YCB10/
@@ -40,6 +47,7 @@ class OCIDSequenceDataset(Dataset):
         train_ratio: float = 0.8,
         random_seed: int = 42,
         test_sequences: List[str] = None,
+        num_points: int = 5,
     ):
         """
         Args:
@@ -51,11 +59,13 @@ class OCIDSequenceDataset(Dataset):
             random_seed: Random seed for train/val split
             test_sequences: List of sequence names for test (e.g., ["seq13"])
                            If None, defaults to ["seq13"]
+            num_points: Number of prompt points to sample per instance
         """
         self.root_dir = Path(root_dir)
         self.split = split
         self.num_frames = num_frames
         self.image_size = image_size
+        self.num_points = num_points
 
         # Default test sequences
         if test_sequences is None:
@@ -77,7 +87,7 @@ class OCIDSequenceDataset(Dataset):
                 trainval_seqs.append(seq)
 
         if split == "test":
-            self.sequences = test_seqs
+            sequences = test_seqs
         else:
             # Train/val split from non-test sequences
             random.seed(random_seed)
@@ -85,11 +95,13 @@ class OCIDSequenceDataset(Dataset):
             split_idx = int(len(trainval_seqs) * train_ratio)
 
             if split == "train":
-                self.sequences = trainval_seqs[:split_idx]
+                sequences = trainval_seqs[:split_idx]
             else:  # val
-                self.sequences = trainval_seqs[split_idx:]
+                sequences = trainval_seqs[split_idx:]
 
-        print(f"Loaded {len(self.sequences)} sequences for {split}")
+        # Build instance-aware samples: (sequence, object_id)
+        self.samples = self._build_instance_samples(sequences)
+        print(f"Loaded {len(self.samples)} instance samples from {len(sequences)} sequences for {split}")
 
     def _find_sequences(self) -> List[Path]:
         """Find all valid sequences in the dataset."""
@@ -113,8 +125,36 @@ class OCIDSequenceDataset(Dataset):
 
         return sequences
 
+    def _build_instance_samples(self, sequences: List[Path]) -> List[Tuple[Path, int]]:
+        """
+        Build list of (sequence, object_id) pairs.
+
+        For each sequence, find all unique object IDs and create a sample for each.
+        """
+        samples = []
+
+        for seq_dir in sequences:
+            # Get the last frame's label to find all objects
+            label_dir = seq_dir / "label"
+            label_files = sorted(list(label_dir.glob("*.png")))
+
+            if not label_files:
+                continue
+
+            # Use last frame to get maximum number of objects
+            last_label = np.array(Image.open(label_files[-1]))
+            unique_ids = np.unique(last_label)
+
+            # Filter out background (0)
+            object_ids = [int(oid) for oid in unique_ids if oid > 0]
+
+            for obj_id in object_ids:
+                samples.append((seq_dir, obj_id))
+
+        return samples
+
     def __len__(self) -> int:
-        return len(self.sequences)
+        return len(self.samples)
 
     def _get_frame_pairs(self, seq_dir: Path) -> List[Tuple[Path, Path]]:
         """Get matching RGB and label file pairs."""
@@ -122,7 +162,6 @@ class OCIDSequenceDataset(Dataset):
         label_dir = seq_dir / "label"
 
         rgb_files = sorted(list(rgb_dir.glob("*.png")))
-        label_files = sorted(list(label_dir.glob("*.png")))
 
         # Match by filename
         pairs = []
@@ -133,16 +172,40 @@ class OCIDSequenceDataset(Dataset):
 
         return pairs
 
-    def _sample_frames(
-        self, pairs: List[Tuple[Path, Path]], num_frames: int
-    ) -> List[Tuple[Path, Path]]:
-        """Sample frames from sequence."""
-        if len(pairs) <= num_frames:
-            return pairs
+    def _sample_frames_for_instance(
+        self,
+        pairs: List[Tuple[Path, Path]],
+        object_id: int,
+        num_frames: int,
+    ) -> List[Tuple[Path, Path, int]]:
+        """
+        Sample frames where the target object exists.
 
-        # Evenly sample frames
-        indices = np.linspace(0, len(pairs) - 1, num_frames, dtype=int)
-        return [pairs[i] for i in indices]
+        Returns list of (rgb_path, label_path, start_frame_idx) tuples.
+        start_frame_idx indicates when this object first appears.
+        """
+        # Find frames where object exists
+        valid_pairs = []
+        for i, (rgb_path, label_path) in enumerate(pairs):
+            label = np.array(Image.open(label_path))
+            if object_id in label:
+                valid_pairs.append((rgb_path, label_path, i))
+
+        if len(valid_pairs) == 0:
+            return []
+
+        if len(valid_pairs) >= num_frames:
+            # Evenly sample from valid frames
+            indices = np.linspace(0, len(valid_pairs) - 1, num_frames, dtype=int)
+            return [valid_pairs[i] for i in indices]
+
+        # Pad by repeating frames to reach num_frames
+        # This ensures consistent tensor sizes for batching
+        result = []
+        for i in range(num_frames):
+            idx = i % len(valid_pairs)
+            result.append(valid_pairs[idx])
+        return result
 
     def _load_image(self, path: Path) -> torch.Tensor:
         """Load and preprocess RGB image."""
@@ -152,14 +215,24 @@ class OCIDSequenceDataset(Dataset):
         img = torch.from_numpy(img).permute(2, 0, 1)  # HWC -> CHW
         return img
 
-    def _load_mask(self, path: Path) -> torch.Tensor:
-        """Load and preprocess segmentation mask."""
-        mask = Image.open(path).convert("L")  # Grayscale
-        mask = mask.resize((self.image_size, self.image_size), Image.NEAREST)
-        mask = np.array(mask).astype(np.float32)
+    def _load_instance_mask(self, path: Path, object_id: int) -> torch.Tensor:
+        """
+        Load instance segmentation mask for a specific object.
 
-        # Binarize: 0 = background, 1 = object
-        mask = (mask > 0).astype(np.float32)
+        Args:
+            path: Path to label image
+            object_id: Target object ID
+
+        Returns:
+            Binary mask (H, W) where 1 = target object, 0 = everything else
+        """
+        # Load as 16-bit to handle large instance IDs
+        label = Image.open(path)
+        label = label.resize((self.image_size, self.image_size), Image.NEAREST)
+        label = np.array(label)
+
+        # Create binary mask for this specific instance
+        mask = (label == object_id).astype(np.float32)
         mask = torch.from_numpy(mask)
         return mask
 
@@ -194,32 +267,47 @@ class OCIDSequenceDataset(Dataset):
 
         return points
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Dict:
         """
-        Get a sequence sample.
+        Get an instance-aware sequence sample.
 
         Returns:
             Dictionary containing:
                 - frames: (T, C, H, W) RGB frames
-                - masks: (T, H, W) binary masks
+                - masks: (T, H, W) binary masks for the specific instance
                 - points: (N, 2) prompt points from first frame
                 - seq_name: sequence name (string)
+                - object_id: target object ID (int)
         """
-        seq_dir = self.sequences[idx]
+        seq_dir, object_id = self.samples[idx]
 
         # Get frame pairs
         pairs = self._get_frame_pairs(seq_dir)
 
-        # Sample frames
-        sampled_pairs = self._sample_frames(pairs, self.num_frames)
+        # Sample frames where object exists
+        sampled_data = self._sample_frames_for_instance(pairs, object_id, self.num_frames)
+
+        if len(sampled_data) == 0:
+            # Fallback: object doesn't exist, return empty sample
+            # This shouldn't happen if _build_instance_samples is correct
+            frames = torch.zeros(1, 3, self.image_size, self.image_size)
+            masks = torch.zeros(1, self.image_size, self.image_size)
+            points = torch.tensor([[self.image_size // 2, self.image_size // 2]], dtype=torch.float32)
+            return {
+                "frames": frames,
+                "masks": masks,
+                "points": points,
+                "seq_name": str(seq_dir.relative_to(self.root_dir)),
+                "object_id": object_id,
+            }
 
         # Load frames and masks
         frames = []
         masks = []
 
-        for rgb_path, label_path in sampled_pairs:
+        for rgb_path, label_path, _ in sampled_data:
             frame = self._load_image(rgb_path)
-            mask = self._load_mask(label_path)
+            mask = self._load_instance_mask(label_path, object_id)
 
             frames.append(frame)
             masks.append(mask)
@@ -227,18 +315,19 @@ class OCIDSequenceDataset(Dataset):
         frames = torch.stack(frames)  # (T, C, H, W)
         masks = torch.stack(masks)  # (T, H, W)
 
-        # Get prompt points from first frame
-        points = self._get_prompt_points(masks[0], num_points=5)
+        # Get prompt points from first frame's mask
+        points = self._get_prompt_points(masks[0], num_points=self.num_points)
 
         return {
             "frames": frames,
             "masks": masks,
             "points": points,
             "seq_name": str(seq_dir.relative_to(self.root_dir)),
+            "object_id": object_id,
         }
 
 
-def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
+def collate_fn(batch: List[Dict]) -> Dict:
     """
     Collate function for DataLoader.
 
@@ -251,6 +340,7 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         "masks": torch.stack([item["masks"] for item in batch]),  # (B, T, H, W)
         "points": [item["points"] for item in batch],  # List of (N, 2)
         "seq_names": [item["seq_name"] for item in batch],
+        "object_ids": [item["object_id"] for item in batch],  # List of int
     }
 
 
@@ -263,6 +353,7 @@ def get_dataloaders(
     train_ratio: float = 0.8,
     test_sequences: List[str] = None,
     include_test: bool = False,
+    num_points: int = 5,
 ):
     """
     Create train, validation, and optionally test dataloaders.
@@ -276,26 +367,29 @@ def get_dataloaders(
         train_ratio: Train/val split ratio (from non-test sequences)
         test_sequences: List of sequence names for test (default: ["seq13"])
         include_test: If True, returns (train_loader, val_loader, test_loader)
+        num_points: Number of prompt points per instance
 
     Returns:
         (train_loader, val_loader) or (train_loader, val_loader, test_loader)
     """
-    train_dataset = OCIDSequenceDataset(
+    train_dataset = OCIDInstanceDataset(
         root_dir=root_dir,
         split="train",
         num_frames=num_frames,
         image_size=image_size,
         train_ratio=train_ratio,
         test_sequences=test_sequences,
+        num_points=num_points,
     )
 
-    val_dataset = OCIDSequenceDataset(
+    val_dataset = OCIDInstanceDataset(
         root_dir=root_dir,
         split="val",
         num_frames=num_frames,
         image_size=image_size,
         train_ratio=train_ratio,
         test_sequences=test_sequences,
+        num_points=num_points,
     )
 
     train_loader = torch.utils.data.DataLoader(
@@ -317,12 +411,13 @@ def get_dataloaders(
     )
 
     if include_test:
-        test_dataset = OCIDSequenceDataset(
+        test_dataset = OCIDInstanceDataset(
             root_dir=root_dir,
             split="test",
             num_frames=num_frames,
             image_size=image_size,
             test_sequences=test_sequences,
+            num_points=num_points,
         )
 
         test_loader = torch.utils.data.DataLoader(
@@ -341,29 +436,31 @@ def get_dataloaders(
 
 if __name__ == "__main__":
     # Test dataset
-    print("Testing OCID Dataset Loader...")
+    print("Testing OCID Instance Dataset Loader...")
 
-    dataset = OCIDSequenceDataset(
-        root_dir="data/OCID-dataset",
+    dataset = OCIDInstanceDataset(
+        root_dir="data/OCID-dataset/ARID20/table/bottom",
         split="train",
         num_frames=8,
         image_size=1024,
     )
 
-    print(f"\nDataset size: {len(dataset)}")
+    print(f"\nDataset size: {len(dataset)} instance samples")
 
     # Get first sample
     sample = dataset[0]
     print(f"\nSample 0:")
     print(f"  Sequence: {sample['seq_name']}")
+    print(f"  Object ID: {sample['object_id']}")
     print(f"  Frames shape: {sample['frames'].shape}")
     print(f"  Masks shape: {sample['masks'].shape}")
     print(f"  Points shape: {sample['points'].shape}")
-    print(f"  Num objects in first frame: {sample['masks'][0].max():.0f}")
+    print(f"  Mask is binary: min={sample['masks'].min():.0f}, max={sample['masks'].max():.0f}")
 
     # Test dataloader
     print("\nTesting DataLoader...")
     train_loader, val_loader = get_dataloaders(
+        root_dir="data/OCID-dataset/ARID20/table/bottom",
         batch_size=2,
         num_frames=4,
         num_workers=0,
@@ -377,8 +474,8 @@ if __name__ == "__main__":
     print(f"\nBatch:")
     print(f"  Frames: {batch['frames'].shape}")  # (B, T, C, H, W)
     print(f"  Masks: {batch['masks'].shape}")  # (B, T, H, W)
-    print(f"  Points: {len(batch['points'])} sequences")
+    print(f"  Points: {len(batch['points'])} instances")
     print(f"  Seq names: {batch['seq_names']}")
+    print(f"  Object IDs: {batch['object_ids']}")
 
-    print("\n✓ Dataset loader working correctly!")
-    print("\n✓ Dataset loader working correctly!")
+    print("\n✓ Instance-aware dataset loader working correctly!")

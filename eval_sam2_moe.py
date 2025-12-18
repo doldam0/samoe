@@ -255,6 +255,15 @@ class SAM2MoEEvaluator:
         edge_union = pred_edges.sum() + target_edges.sum() - edge_intersection
         boundary_iou = (edge_intersection / (edge_union + 1e-6)).item()
 
+        # J (Jaccard Index) = IoU - already computed above
+        j_score = iou
+
+        # F (Boundary F-measure)
+        f_score = self._compute_boundary_f_measure(pred_binary, target)
+
+        # J&F (average of J and F)
+        j_and_f = (j_score + f_score) / 2.0
+
         return {
             "iou": iou,
             "pixel_iou": pixel_iou,
@@ -266,6 +275,9 @@ class SAM2MoEEvaluator:
             "sq": sq,
             "rq": rq,
             "boundary_iou": boundary_iou,
+            "J": j_score,
+            "F": f_score,
+            "J&F": j_and_f,
         }
 
     def compute_ap_at_threshold(
@@ -306,6 +318,63 @@ class SAM2MoEEvaluator:
 
         return edges.squeeze(0).squeeze(0)
 
+    def _compute_boundary_f_measure(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        bound_th: float = 0.008,
+    ) -> float:
+        """
+        Compute Boundary F-measure (F) for VOS evaluation.
+
+        This measures how well the predicted boundary aligns with GT boundary.
+        Based on the DAVIS benchmark evaluation protocol.
+
+        Args:
+            pred: Predicted binary mask
+            target: Ground truth binary mask
+            bound_th: Boundary threshold as fraction of image diagonal
+
+        Returns:
+            F-measure score (0 to 1)
+        """
+        # Get boundary pixels
+        pred_boundary = self._compute_edges(pred)
+        target_boundary = self._compute_edges(target)
+
+        # Compute distance threshold based on image size
+        h, w = pred.shape
+        bound_pix = bound_th * np.sqrt(h ** 2 + w ** 2)
+
+        # Get boundary coordinates
+        pred_coords = torch.nonzero(pred_boundary > 0.5, as_tuple=False).float()
+        target_coords = torch.nonzero(target_boundary > 0.5, as_tuple=False).float()
+
+        if len(pred_coords) == 0 and len(target_coords) == 0:
+            return 1.0  # Both empty = perfect match
+        if len(pred_coords) == 0 or len(target_coords) == 0:
+            return 0.0  # One empty = no match
+
+        # Compute precision: fraction of pred boundary within threshold of target
+        if len(pred_coords) > 0 and len(target_coords) > 0:
+            # For each pred point, find min distance to target
+            dist_pred_to_target = torch.cdist(pred_coords, target_coords).min(dim=1)[0]
+            precision = (dist_pred_to_target <= bound_pix).float().mean().item()
+
+            # For each target point, find min distance to pred
+            dist_target_to_pred = torch.cdist(target_coords, pred_coords).min(dim=1)[0]
+            recall = (dist_target_to_pred <= bound_pix).float().mean().item()
+        else:
+            precision, recall = 0.0, 0.0
+
+        # F-measure
+        if precision + recall > 0:
+            f_measure = 2 * precision * recall / (precision + recall)
+        else:
+            f_measure = 0.0
+
+        return f_measure
+
     @torch.no_grad()
     def evaluate(self) -> Dict:
         """Run evaluation on validation set."""
@@ -325,6 +394,7 @@ class SAM2MoEEvaluator:
             masks = batch["masks"][0].to(self.device)    # (T, H, W)
             points = batch["points"][0].to(self.device)  # (N, 2)
             seq_name = batch["seq_names"][0]
+            object_id = batch["object_ids"][0]
 
             T = frames.shape[0]
             output_dict = {
@@ -379,19 +449,20 @@ class SAM2MoEEvaluator:
                     logger.warning(f"Error in {seq_name}, frame {t}: {e}")
                     continue
 
-            # Aggregate sequence metrics
+            # Aggregate instance metrics
             if seq_metrics:
-                seq_result = {
+                instance_result = {
                     "seq_name": seq_name,
+                    "object_id": object_id,
                     "num_frames": len(seq_metrics),
                 }
                 for key in seq_metrics[0].keys():
-                    seq_result[key] = np.mean([m[key] for m in seq_metrics])
-                sequence_results.append(seq_result)
+                    instance_result[key] = np.mean([m[key] for m in seq_metrics])
+                sequence_results.append(instance_result)
 
                 pbar.set_postfix({
-                    "IoU": f"{seq_result['iou']:.4f}",
-                    "PQ": f"{seq_result['pq']:.4f}",
+                    "IoU": f"{instance_result['iou']:.4f}",
+                    "PQ": f"{instance_result['pq']:.4f}",
                 })
 
         # Aggregate overall metrics
@@ -421,7 +492,7 @@ class SAM2MoEEvaluator:
             / (overall["overall_precision"] + overall["overall_recall"] + 1e-6)
         )
 
-        overall["num_sequences"] = len(sequence_results)
+        overall["num_instances"] = len(sequence_results)
         overall["num_frames"] = len(all_metrics)
 
         return {
@@ -532,6 +603,7 @@ def run_multiple_evaluations(args) -> Dict:
         "mean_iou", "mean_pixel_iou", "mean_dice",
         "overall_precision", "overall_recall", "overall_f1",
         "total_tp", "total_fp", "total_fn",
+        "mean_J", "mean_F", "mean_J&F",
     ]
 
     for key in keys_to_aggregate:
@@ -590,6 +662,12 @@ def print_results(results: Dict, model_name: str = "SAMoE"):
     print(f"- Overall Precision: {agg['overall_precision_mean']:.4f} ± {agg['overall_precision_std']:.4f}")
     print(f"- Overall Recall: {agg['overall_recall_mean']:.4f} ± {agg['overall_recall_std']:.4f}")
     print(f"- Overall F1: {agg['overall_f1_mean']:.4f} ± {agg['overall_f1_std']:.4f}")
+    print()
+
+    print("**VOS Metrics (J & F):**")
+    print(f"- J (IoU): {agg['mean_J_mean']:.4f} ± {agg['mean_J_std']:.4f}")
+    print(f"- F (Boundary F-measure): {agg['mean_F_mean']:.4f} ± {agg['mean_F_std']:.4f}")
+    print(f"- J&F: {agg['mean_J&F_mean']:.4f} ± {agg['mean_J&F_std']:.4f}")
 
 
 def main():
